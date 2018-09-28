@@ -1,12 +1,13 @@
 package com.gsrk.graphql.mongodb;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
-import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
 import org.dataloader.BatchLoader;
@@ -27,8 +28,13 @@ import com.gsrk.graphql.mongodb.model.Book;
 @RestController
 public class FetchBookResource {
 	
+	private static Map<String,DataLoader<String,Book>> dataLoaderInstance = new HashMap<String,DataLoader<String,Book>>();
+	
 	@Autowired
 	RestTemplate restTemplate;
+	
+	@Autowired
+	public DataLoader<String,Book> createBooksDataLoaderBean;
 	
 	@RequestMapping(value="/all",method=RequestMethod.GET,produces= {MediaType.APPLICATION_JSON_VALUE})
 	public ResponseEntity<List<Book>> fetchBooks(){
@@ -60,7 +66,7 @@ public class FetchBookResource {
 				e.printStackTrace();
 			}
 		}
-		
+//		
 		return ResponseEntity.ok(resultBooks);
 	}
 	
@@ -78,10 +84,13 @@ public class FetchBookResource {
 		            });
 		
 		List<Book> books = booksListResp.getBody();
-		
-		List<CompletableFuture<Book>> cfBooks = books.stream().map(book -> fetchBookAsync(book)).collect(Collectors.toList());
-		
-		List<Book> resultBooks = cfBooks.stream().map(CompletableFuture::join).collect(Collectors.toList());
+		long startTime = System.currentTimeMillis();
+		System.out.println("fetchBooksByNewAsync 1 method is running by Thread Name:"+Thread.currentThread().getName());
+
+		List<CompletableFuture<Book>> cfBooks = books.parallelStream().map(book -> fetchBookAsync(book)).collect(Collectors.toList());
+		System.out.println("fetchBooksByNewAsync 2 method is running by Thread Name:"+Thread.currentThread().getName());
+		List<Book> resultBooks = cfBooks.parallelStream().map(CompletableFuture::join).collect(Collectors.toList());
+		System.out.println("Time Taken:"+(System.currentTimeMillis() - startTime));
 		return ResponseEntity.ok(resultBooks);
 	}
 	
@@ -92,6 +101,7 @@ public class FetchBookResource {
 			@Override
 			public Book get() {
 				// TODO Auto-generated method stub
+				System.out.println("fetchBookAsync Book Id:"+book.getId()+" by Thread Name:"+Thread.currentThread().getName());
 				ResponseEntity<Book> resultBookEntity =
 				        restTemplate.getForEntity("http://localhost:8080/book/"+book.getId(), Book.class);
 				return resultBookEntity.getBody();
@@ -109,7 +119,7 @@ public class FetchBookResource {
 		            });
 		
 		List<Book> books = booksListResp.getBody();
-		
+		long startTime = System.currentTimeMillis();
 		List<String> keys = new ArrayList<String>();
 		for(Book book:books) {
 			keys.add(book.getId());
@@ -117,25 +127,25 @@ public class FetchBookResource {
 		List<CompletableFuture<Book>> cfBooks = fetchBooksByDataLoader(keys);
 		
 		List<Book> resultBooks = cfBooks.stream().map(CompletableFuture::join).collect(Collectors.toList());
+		System.out.println("Time Taken:"+(System.currentTimeMillis() - startTime));
 		return ResponseEntity.ok(resultBooks);
 	}
 	
 	public List<CompletableFuture<Book>> fetchBooksByDataLoader(List<String> keys) {
-		DataLoaderOptions dlo = new DataLoaderOptions();
-		dlo.setBatchingEnabled(false);
-		dlo.setCachingEnabled(false);
-		DataLoader<String, Book> booksDataLoader = new DataLoader<String,Book>(fetchBatchLoder(keys),dlo);
+	
+		DataLoader<String, Book> booksDataLoader = createDataLoader(keys,"booksDataLoader");
 		List<CompletableFuture<Book>> listOfCFBook = new ArrayList<CompletableFuture<Book>>();
 		for(String key:keys) {
 			CompletableFuture<Book> cfBook = booksDataLoader.load(key);
 			listOfCFBook.add(cfBook);
 		}
-		
+		booksDataLoader.dispatch();
 		return listOfCFBook;
 	}
 	
 	public BatchLoader<String, Book> fetchBatchLoder(List<String> keys){
-		
+		System.out.println("calling fetchBatchLoader...");
+
 		BatchLoader<String, Book> batchLoader = new BatchLoader<String, Book>() {
 			
 			@Override
@@ -149,6 +159,7 @@ public class FetchBookResource {
 	}
 	
 	public CompletionStage<List<Book>> loadBooks(List<String> keys){
+		System.out.println("calling loadBooks...");
 		List<Book> books = new ArrayList<Book>();
 		for(String key:keys) {
 			ResponseEntity<Book> resultBookEntity =
@@ -174,6 +185,47 @@ public class FetchBookResource {
 		});
 		 */
 	}
-
-
+	
+	public DataLoader<String, Book> createDataLoader(List<String> keys,String loaderKey) {
+		DataLoader<String, Book> booksDataLoader = null;
+		if(dataLoaderInstance.containsKey(loaderKey)) {
+			booksDataLoader =  dataLoaderInstance.get(loaderKey);
+		}
+		else {
+			DataLoaderOptions dlo = new DataLoaderOptions();
+			dlo.setBatchingEnabled(true);
+			dlo.setCachingEnabled(true);
+			booksDataLoader = new DataLoader<String,Book>(fetchBatchLoder(keys),dlo);
+			dataLoaderInstance.put(loaderKey, booksDataLoader);
+		}
+		return booksDataLoader;
+	}
+	
+	@RequestMapping(value="/async/all/v4",method=RequestMethod.GET,produces= {MediaType.APPLICATION_JSON_VALUE})
+	public ResponseEntity<List<Book>> fetchBooksByDataLoaderBean(){
+		ResponseEntity<List<Book>> booksListResp =
+		        restTemplate.exchange("http://localhost:8080/book/all",
+		                    HttpMethod.GET, null, new ParameterizedTypeReference<List<Book>>() {
+		            });
+		
+		List<Book> books = booksListResp.getBody();
+		long startTime = System.currentTimeMillis();
+		List<String> keys = new ArrayList<String>();
+		for(Book book:books) {
+			keys.add(book.getId());
+		}
+		//DataLoader<String, Book> booksDataLoader = dataLoaderMap.get("booksDataLoader");
+		List<CompletableFuture<Book>> listOfCFBook = keys.parallelStream().map(key -> createBooksDataLoaderBean.load(key)).collect(Collectors.toList());
+//		for(String key:keys) {
+//			System.out.println("fetchBooksByDataLoaderBean 1 Book Id:"+key+" by Thread Name:"+Thread.currentThread().getName());
+//			CompletableFuture<Book> cfBook = createBooksDataLoaderBean.load(key);
+//			listOfCFBook.add(cfBook);
+//			System.out.println("fetchBooksByDataLoaderBean 2 Book Id:"+key+" by Thread Name:"+Thread.currentThread().getName());
+//
+//		}
+		createBooksDataLoaderBean.dispatch();
+		List<Book> resultBooks = listOfCFBook.parallelStream().map(CompletableFuture::join).collect(Collectors.toList());
+		System.out.println("Time Taken:"+(System.currentTimeMillis() - startTime));
+		return ResponseEntity.ok(resultBooks);
+	}
 }
